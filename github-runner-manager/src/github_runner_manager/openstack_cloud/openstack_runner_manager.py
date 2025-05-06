@@ -10,29 +10,25 @@ from pathlib import Path
 from typing import Iterable, Sequence
 
 import fabric
-import invoke
 import jinja2
 import paramiko
 from fabric import Connection as SSHConnection
 
-from github_runner_manager import constants
-from github_runner_manager.configuration import SupportServiceConfig
+from github_runner_manager.configuration import UserInfo
 from github_runner_manager.errors import (
     KeyfileError,
     MissingServerConfigError,
     OpenStackError,
     OpenstackHealthCheckError,
     RunnerCreateError,
-    RunnerStartError,
     SSHError,
 )
 from github_runner_manager.manager.cloud_runner_manager import (
-    CloudInitStatus,
     CloudRunnerInstance,
     CloudRunnerManager,
     CloudRunnerState,
 )
-from github_runner_manager.manager.models import InstanceID
+from github_runner_manager.manager.models import InstanceID, RunnerContext, RunnerMetadata
 from github_runner_manager.manager.runner_manager import HealthState
 from github_runner_manager.metrics import runner as runner_metrics
 from github_runner_manager.openstack_cloud import health_checks
@@ -42,11 +38,8 @@ from github_runner_manager.openstack_cloud.constants import (
     RUNNER_LISTENER_PROCESS,
     RUNNER_WORKER_PROCESS,
 )
-from github_runner_manager.openstack_cloud.openstack_cloud import (
-    OpenstackCloud,
-    OpenStackCredentials,
-    OpenstackInstance,
-)
+from github_runner_manager.openstack_cloud.models import OpenStackRunnerManagerConfig
+from github_runner_manager.openstack_cloud.openstack_cloud import OpenstackCloud, OpenstackInstance
 from github_runner_manager.repo_policy_compliance_client import RepoPolicyComplianceClient
 from github_runner_manager.utilities import retry, set_env_var
 
@@ -66,38 +59,6 @@ HEALTH_CHECK_ERROR_LOG_MSG = "Health check could not be completed for %s"
 
 class _GithubRunnerRemoveError(Exception):
     """Represents an error while SSH into a runner and running the remove script."""
-
-
-@dataclass
-class OpenStackServerConfig:
-    """Configuration for OpenStack server.
-
-    Attributes:
-        image: The image name for runners to use.
-        flavor: The flavor name for runners to use.
-        network: The network name for runners to use.
-    """
-
-    image: str
-    flavor: str
-    network: str
-
-
-@dataclass
-class OpenStackRunnerManagerConfig:
-    """Configuration for OpenStack runner manager.
-
-    Attributes:
-        prefix: The prefix of the runner names.
-        credentials: The OpenStack authorization information.
-        server_config: The configuration for OpenStack server.
-        service_config: The configuration for supporting services.
-    """
-
-    prefix: str
-    credentials: OpenStackCredentials
-    server_config: OpenStackServerConfig | None
-    service_config: SupportServiceConfig
 
 
 @dataclass
@@ -125,18 +86,20 @@ class OpenStackRunnerManager(CloudRunnerManager):
     def __init__(
         self,
         config: OpenStackRunnerManagerConfig,
+        user: UserInfo,
     ) -> None:
         """Construct the object.
 
         Args:
             config: The configuration for the openstack runner manager.
+            user: The
         """
         self._config = config
         self._credentials = config.credentials
         self._openstack_cloud = OpenstackCloud(
             credentials=self._credentials,
             prefix=self.name_prefix,
-            system_user=constants.RUNNER_MANAGER_USER,
+            system_user=user.user,
             proxy_command=config.service_config.manager_proxy_command,
         )
         # Setting the env var to this process and any child process spawned.
@@ -157,38 +120,43 @@ class OpenStackRunnerManager(CloudRunnerManager):
         """
         return self._config.prefix
 
-    def create_runner(self, instance_id: InstanceID, registration_jittoken: str) -> None:
+    def create_runner(
+        self,
+        instance_id: InstanceID,
+        metadata: RunnerMetadata,
+        runner_context: RunnerContext,
+    ) -> CloudRunnerInstance:
         """Create a self-hosted runner.
 
         Args:
             instance_id: Instance ID for the runner to create.
-            registration_jittoken: The JIT GitHub registration token for registering runners.
+            metadata: Metadata for the runner.
+            runner_context: Context data for spawning the runner.
 
         Raises:
             MissingServerConfigError: Unable to create runner due to missing configuration.
             RunnerCreateError: Unable to create runner due to OpenStack issues.
+
+        Returns:
+            The newly created runner instance.
         """
         if (server_config := self._config.server_config) is None:
             raise MissingServerConfigError("Missing server configuration to create runners")
 
-        cloud_init = self._generate_cloud_init(registration_jittoken=registration_jittoken)
+        cloud_init = self._generate_cloud_init(runner_context=runner_context)
         try:
             instance = self._openstack_cloud.launch_instance(
+                metadata=metadata,
                 instance_id=instance_id,
-                image=server_config.image,
-                flavor=server_config.flavor,
-                network=server_config.network,
+                server_config=server_config,
                 cloud_init=cloud_init,
+                ingress_tcp_ports=runner_context.ingress_tcp_ports,
             )
         except OpenStackError as err:
             raise RunnerCreateError(f"Failed to create {instance_id} openstack runner") from err
 
-        logger.debug("Waiting for runner process to startup: %s", instance.instance_id)
-        self._wait_runner_startup(instance)
-        logger.debug("Waiting for runner process to be running: %s", instance.instance_id)
-        self._wait_runner_running(instance)
-
         logger.info("Runner %s created successfully", instance.instance_id)
+        return self._build_cloud_runner_instance(instance)
 
     def get_runners(
         self, states: Sequence[CloudRunnerState] | None = None
@@ -212,19 +180,25 @@ class OpenStackRunnerManager(CloudRunnerManager):
             except OpenstackHealthCheckError:
                 logger.exception(HEALTH_CHECK_ERROR_LOG_MSG, instance.instance_id.name)
                 healthy = None
-            runners.append(
-                CloudRunnerInstance(
-                    name=instance.instance_id.name,
-                    instance_id=instance.instance_id,
-                    health=HealthState.from_value(healthy),
-                    state=CloudRunnerState.from_openstack_server_status(instance.status),
-                )
-            )
+            runners.append(self._build_cloud_runner_instance(instance, healthy))
         if states is None:
             return tuple(runners)
 
         state_set = set(states)
         return tuple(runner for runner in runners if runner.state in state_set)
+
+    def _build_cloud_runner_instance(
+        self, instance: OpenstackInstance, healthy: bool | None = None
+    ) -> CloudRunnerInstance:
+        """Build a new cloud runner instance from an openstack instance."""
+        metadata = instance.metadata
+        return CloudRunnerInstance(
+            name=instance.instance_id.name,
+            metadata=metadata,
+            instance_id=instance.instance_id,
+            health=HealthState.from_value(healthy),
+            state=CloudRunnerState.from_openstack_server_status(instance.status),
+        )
 
     def delete_runner(
         self, instance_id: InstanceID, remove_token: str
@@ -247,13 +221,14 @@ class OpenStackRunnerManager(CloudRunnerManager):
             )
             return None
 
+        pulled_metrics = self._delete_runner(instance, remove_token)
         logger.debug(
             "Metrics extracted, deleting instance %s %s", instance_id, instance.instance_id
         )
-        pulled_metrics = self._delete_runner(instance, remove_token)
         logger.debug("Instance deleted successfully %s %s", instance_id, instance.instance_id)
         logger.debug("Extract metrics for runner %s %s", instance_id, instance.instance_id)
-        return pulled_metrics.to_runner_metrics(instance.instance_id, instance.created_at)
+        cloud_instance = self._build_cloud_runner_instance(instance)
+        return pulled_metrics.to_runner_metrics(cloud_instance, instance.created_at)
 
     def flush_runners(
         self, remove_token: str, busy: bool = False
@@ -309,7 +284,8 @@ class OpenStackRunnerManager(CloudRunnerManager):
         extracted_runner_metrics = []
         for runner in runners.unhealthy:
             pulled_metrics = self._delete_runner(runner, remove_token)
-            runner_metric = pulled_metrics.to_runner_metrics(runner.instance_id, runner.created_at)
+            cloud_runner = self._build_cloud_runner_instance(runner)
+            runner_metric = pulled_metrics.to_runner_metrics(cloud_runner, runner.created_at)
             if not runner_metric:
                 logger.error("No metrics returned after deleting %s", runner.instance_id)
             else:
@@ -386,19 +362,20 @@ class OpenStackRunnerManager(CloudRunnerManager):
             healthy=tuple(healthy), unhealthy=tuple(unhealthy), unknown=tuple(unknown)
         )
 
-    def _generate_cloud_init(self, registration_jittoken: str) -> str:
+    def _generate_cloud_init(self, runner_context: RunnerContext) -> str:
         """Generate cloud init userdata.
 
         This is the script the openstack server runs on startup.
 
         Args:
-            registration_jittoken: The JIT GitHub runner registration token.
+            runner_context: Context for the runner.
 
         Returns:
             The cloud init userdata for openstack instance.
         """
-        jinja = jinja2.Environment(
-            loader=jinja2.PackageLoader("github_runner_manager", "templates"), autoescape=True
+        # We do not autoscape, the reason is that we are not generating html or xml
+        jinja = jinja2.Environment(  # nosec
+            loader=jinja2.PackageLoader("github_runner_manager", "templates")
         )
 
         service_config = self._config.service_config
@@ -439,7 +416,7 @@ class OpenStackRunnerManager(CloudRunnerManager):
             service_config.runner_proxy_config.proxy_address if service_config.use_aproxy else None
         )
         return jinja.get_template("openstack-userdata.sh.j2").render(
-            jittoken=registration_jittoken,
+            run_script=runner_context.shell_run_script,
             env_contents=env_contents,
             pre_job_contents=pre_job_contents,
             metrics_exchange_path=str(METRICS_EXCHANGE_PATH),
@@ -522,80 +499,6 @@ class OpenStackRunnerManager(CloudRunnerManager):
             result.stdout,
             result.stderr,
         )
-
-    @retry(tries=10, delay=60, local_logger=logger)
-    def _wait_runner_startup(self, instance: OpenstackInstance) -> None:
-        """Wait until runner is startup.
-
-        Args:
-            instance: The runner instance.
-
-        Raises:
-            RunnerStartError: The runner startup process was not found on the runner.
-        """
-        try:
-            ssh_conn = self._openstack_cloud.get_ssh_connection(instance)
-        except SSHError as err:
-            raise RunnerStartError(
-                f"Failed to SSH to {instance.instance_id} during creation possible due to setup "
-                "not completed"
-            ) from err
-
-        logger.debug("Running `cloud-init status` on instance %s.", instance.instance_id)
-        result: invoke.runners.Result = ssh_conn.run("cloud-init status", warn=True, timeout=60)
-        if not result.ok:
-            logger.warning(
-                "cloud-init status command failed on %s: %s.", instance.instance_id, result.stderr
-            )
-            raise RunnerStartError(f"Runner startup process not found on {instance.instance_id}")
-        # A short running job may have already completed and exited the runner, hence check the
-        # condition via cloud-init status check.
-        if CloudInitStatus.DONE in result.stdout:
-            return
-        logger.debug("Running `ps aux` on instance %s.", instance.instance_id)
-        result = ssh_conn.run("ps aux", warn=True, timeout=60, hide=True)
-        if not result.ok:
-            logger.warning("SSH run of `ps aux` failed on %s", instance.instance_id)
-            raise RunnerStartError(f"Unable to SSH run `ps aux` on {instance.instance_id}")
-        # Runner startup process is the parent process of runner.Listener and runner.Worker which
-        # starts up much faster.
-        if RUNNER_STARTUP_PROCESS not in result.stdout:
-            logger.warning("Runner startup process not found on %s", instance.instance_id)
-            raise RunnerStartError(f"Runner startup process not found on {instance.instance_id}")
-        logger.info("Runner startup process found to be healthy on %s", instance.instance_id)
-
-    @retry(tries=5, delay=60, local_logger=logger)
-    def _wait_runner_running(self, instance: OpenstackInstance) -> None:
-        """Wait until runner is running.
-
-        Args:
-            instance: The runner instance.
-
-        Raises:
-            RunnerStartError: The runner process was not found on the runner.
-        """
-        try:
-            ssh_conn = self._openstack_cloud.get_ssh_connection(instance)
-        except SSHError as err:
-            raise RunnerStartError(
-                f"Failed to SSH connect to {instance.instance_id} openstack runner"
-            ) from err
-
-        try:
-            healthy = health_checks.check_active_runner(
-                ssh_conn=ssh_conn, instance=instance, accept_finished_job=True
-            )
-        except OpenstackHealthCheckError as exc:
-            raise RunnerStartError(
-                f"Failed to check health of runner process on {instance.instance_id}"
-            ) from exc
-        if not healthy:
-            logger.info("Runner %s not considered healthy", instance.instance_id)
-            raise RunnerStartError(
-                f"Runner {instance.instance_id} failed to initialize after starting"
-            )
-
-        logger.info("Runner %s found to be healthy", instance.instance_id)
 
     @staticmethod
     def _run_runner_removal_script(

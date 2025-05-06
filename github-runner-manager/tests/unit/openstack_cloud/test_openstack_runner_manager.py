@@ -10,22 +10,19 @@ from unittest.mock import ANY, MagicMock
 
 import pytest
 
-from github_runner_manager.configuration import ProxyConfig, SupportServiceConfig
+from github_runner_manager.configuration import ProxyConfig, SupportServiceConfig, UserInfo
 from github_runner_manager.errors import OpenstackHealthCheckError
-from github_runner_manager.manager.models import InstanceID
-from github_runner_manager.metrics import runner
-from github_runner_manager.metrics.runner import (
+from github_runner_manager.manager.cloud_runner_manager import (
     CodeInformation,
     PostJobMetrics,
     PostJobStatus,
     PreJobMetrics,
-    PullFileError,
     RunnerMetrics,
 )
-from github_runner_manager.openstack_cloud import (
-    health_checks,
-    openstack_cloud,
-)
+from github_runner_manager.manager.models import InstanceID, RunnerContext, RunnerMetadata
+from github_runner_manager.metrics import runner
+from github_runner_manager.metrics.runner import PullFileError
+from github_runner_manager.openstack_cloud import health_checks, openstack_cloud
 from github_runner_manager.openstack_cloud.constants import (
     POST_JOB_METRICS_FILE_NAME,
     PRE_JOB_METRICS_FILE_NAME,
@@ -44,7 +41,9 @@ OPENSTACK_INSTANCE_PREFIX = "test"
 
 
 @pytest.fixture(name="runner_manager")
-def openstack_runner_manager_fixture(monkeypatch: pytest.MonkeyPatch) -> OpenStackRunnerManager:
+def openstack_runner_manager_fixture(
+    monkeypatch: pytest.MonkeyPatch, user_info: UserInfo
+) -> OpenStackRunnerManager:
     """Mock required dependencies/configs and return an OpenStackRunnerManager instance."""
     monkeypatch.setattr(
         "github_runner_manager.openstack_cloud.openstack_runner_manager.OpenstackCloud",
@@ -64,7 +63,7 @@ def openstack_runner_manager_fixture(monkeypatch: pytest.MonkeyPatch) -> OpenSta
         service_config=service_config_mock,
     )
 
-    return OpenStackRunnerManager(config=config)
+    return OpenStackRunnerManager(config=config, user=user_info)
 
 
 @pytest.fixture(name="runner_metrics_mock")
@@ -89,15 +88,15 @@ def test_create_runner_with_aproxy(
     service_config.runner_proxy_config = ProxyConfig(http="http://proxy.example.com:3128")
 
     prefix = "test"
-    registration_jittoken = "jittoken"
+    agent_command = "agent"
+    runner_context = RunnerContext(shell_run_script=agent_command)
     instance_id = InstanceID.build(prefix=prefix)
-    monkeypatch.setattr(runner_manager, "_wait_runner_startup", MagicMock(return_value=None))
-    monkeypatch.setattr(runner_manager, "_wait_runner_running", MagicMock(return_value=None))
+    metadata = RunnerMetadata()
 
-    openstack_cloud = MagicMock()
+    openstack_cloud = MagicMock(spec=OpenstackCloud)
     monkeypatch.setattr(runner_manager, "_openstack_cloud", openstack_cloud)
 
-    runner_manager.create_runner(instance_id, registration_jittoken)
+    runner_manager.create_runner(instance_id, metadata, runner_context)
     openstack_cloud.launch_instance.assert_called_once()
     assert (
         "snap set aproxy proxy=proxy.example.com:3128"
@@ -119,15 +118,15 @@ def test_create_runner_without_aproxy(
     service_config.runner_proxy_config = ProxyConfig(http="http://proxy.example.com:3128")
 
     prefix = "test"
-    registration_jittoken = "jittoken"
+    agent_command = "agent"
+    runner_context = RunnerContext(shell_run_script=agent_command)
     instance_id = InstanceID.build(prefix=prefix)
-    monkeypatch.setattr(runner_manager, "_wait_runner_startup", MagicMock(return_value=None))
-    monkeypatch.setattr(runner_manager, "_wait_runner_running", MagicMock(return_value=None))
+    metadata = RunnerMetadata()
 
-    openstack_cloud = MagicMock()
+    openstack_cloud = MagicMock(spec=OpenstackCloud)
     monkeypatch.setattr(runner_manager, "_openstack_cloud", openstack_cloud)
 
-    runner_manager.create_runner(instance_id, registration_jittoken)
+    runner_manager.create_runner(instance_id, metadata, runner_context)
     openstack_cloud.launch_instance.assert_called_once()
     assert "aproxy" not in openstack_cloud.launch_instance.call_args.kwargs["cloud_init"]
 
@@ -232,6 +231,7 @@ def _params_test_cleanup_extract_metrics():
                     ),
                     installation_start_timestamp=openstack_created_at,
                     installed_timestamp=openstack_installed_at,
+                    metadata=RunnerMetadata(),
                 ),
             ],
             id="Only installed_timestamp. Metric returned.",
@@ -254,6 +254,7 @@ def _params_test_cleanup_extract_metrics():
                         repository="canonical/github-runner-operator",
                         event="workflow_dispatch",
                     ),
+                    metadata=RunnerMetadata(),
                 ),
             ],
             id="installed_timestamp and pre_job_metrics. Metric returned.",
@@ -264,6 +265,7 @@ def _params_test_cleanup_extract_metrics():
             post_job_metrics_str,
             [
                 RunnerMetrics(
+                    metadata=RunnerMetadata(),
                     instance_id=InstanceID(
                         prefix=OPENSTACK_INSTANCE_PREFIX, reactive=False, suffix="unhealthy"
                     ),

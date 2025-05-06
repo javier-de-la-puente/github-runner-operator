@@ -12,7 +12,7 @@ from typing import List, Literal, Optional, TypedDict
 
 from pydantic import BaseModel
 
-from github_runner_manager.manager.models import InstanceID
+from github_runner_manager.manager.models import InstanceID, RunnerMetadata
 
 
 class GitHubRunnerStatus(str, Enum):
@@ -65,24 +65,27 @@ class SelfHostedRunner(BaseModel):
         busy: Whether the runner is executing a job.
         id: Unique identifier of the runner.
         labels: Labels of the runner.
-        os: Operation system of the runner.
         status: The Github runner status.
         instance_id: InstanceID of the runner.
+        metadata: Runner metadata.
+        deletable: Deletable runner. In GitHub, this is equivalent as the runner not
+            existing in GitHub, as that runner cannot get jobs.
     """
 
     busy: bool
     id: int
     labels: list[SelfHostedRunnerLabel]
-    os: str
     status: GitHubRunnerStatus
     instance_id: InstanceID
+    metadata: RunnerMetadata
+    deletable: bool = False
 
     @classmethod
     def build_from_github(cls, github_dict: dict, instance_id: InstanceID) -> "SelfHostedRunner":
         """Build a SelfHostedRunner from the GitHub runner information and the InstanceID.
 
         Args:
-            github_dict: GitHub dictionary from the list_self_hosted_runners endpoint.
+            github_dict: GitHub dictionary from the list_runners endpoint.
             instance_id: InstanceID for the runner.
 
         Returns:
@@ -91,6 +94,9 @@ class SelfHostedRunner(BaseModel):
         """
         github_dict["labels"] = list(github_dict["labels"])
         github_dict["instance_id"] = instance_id
+        github_dict["metadata"] = RunnerMetadata(
+            platform_name="github", runner_id=github_dict["id"]
+        )
         return cls.parse_obj(github_dict)
 
 

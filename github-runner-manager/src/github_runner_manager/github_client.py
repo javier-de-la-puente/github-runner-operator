@@ -13,6 +13,9 @@ from typing import Callable, ParamSpec, TypeVar
 from urllib.error import HTTPError
 
 import requests
+
+# HTTP404NotFoundError is not found by pylint
+from fastcore.net import HTTP404NotFoundError  # pylint: disable=no-name-in-module
 from ghapi.all import GhApi, pages
 from ghapi.page import paged
 from requests import RequestException
@@ -23,16 +26,16 @@ from github_runner_manager.configuration.github import (
     GitHubPath,
     GitHubRepo,
 )
-from github_runner_manager.errors import GithubApiError, JobNotFoundError, TokenError
+from github_runner_manager.errors import JobNotFoundError, PlatformApiError, TokenError
 from github_runner_manager.manager.models import InstanceID
-from github_runner_manager.types_.github import (
-    JITConfig,
-    JobInfo,
-    RemoveToken,
-    SelfHostedRunner,
-)
+from github_runner_manager.types_.github import JITConfig, JobInfo, RemoveToken, SelfHostedRunner
 
 logger = logging.getLogger(__name__)
+
+
+class GithubRunnerNotFoundError(Exception):
+    """Represents an error when the runner could not be found on GitHub."""
+
 
 # Parameters of the function decorated with retry
 ParamT = ParamSpec("ParamT")
@@ -60,7 +63,7 @@ def catch_http_errors(func: Callable[ParamT, ReturnT]) -> Callable[ParamT, Retur
 
         Raises:
             TokenError: If there was an error with the provided token.
-            GithubApiError: If there was an unexpected error using the GitHub API.
+            PlatformApiError: If there was an unexpected error using the GitHub API.
 
         Returns:
             The decorated function.
@@ -74,9 +77,9 @@ def catch_http_errors(func: Callable[ParamT, ReturnT]) -> Callable[ParamT, Retur
                 else:
                     msg = "Provided token has not enough permissions or has reached rate-limit."
                 raise TokenError(msg) from exc
-            raise GithubApiError from exc
+            raise PlatformApiError from exc
         except RequestException as exc:
-            raise GithubApiError from exc
+            raise PlatformApiError from exc
 
     return wrapper
 
@@ -94,8 +97,38 @@ class GithubClient:
         self._client = GhApi(token=self._token)
 
     @catch_http_errors
-    def get_runner_github_info(self, path: GitHubPath, prefix: str) -> list[SelfHostedRunner]:
-        """Get runner information on GitHub under a repo or org.
+    def get_runner(self, path: GitHubPath, prefix: str, runner_id: int) -> SelfHostedRunner:
+        """Get a specific self-hosted runner information under a repo or org.
+
+        Args:
+            path: GitHub repository path in the format '<owner>/<repo>', or the GitHub organization
+                name.
+            prefix: Build the InstanceID with this prefix.
+            runner_id: Runner id to get the self hosted runner.
+
+        Raises:
+            GithubRunnerNotFoundError: If the runner is not found.
+
+        Returns:
+            The information for the requested runner.
+        """
+        try:
+            if isinstance(path, GitHubRepo):
+                raw_runner = self._client.actions.get_self_hosted_runner_for_repo(
+                    path.owner, path.repo, runner_id
+                )
+            else:
+                raw_runner = self._client.actions.get_self_hosted_runner_for_org(
+                    path.org, runner_id
+                )
+        except HTTP404NotFoundError as err:
+            raise GithubRunnerNotFoundError from err
+        instance_id = InstanceID.build_from_name(prefix, raw_runner["name"])
+        return SelfHostedRunner.build_from_github(raw_runner, instance_id)
+
+    @catch_http_errors
+    def list_runners(self, path: GitHubPath, prefix: str) -> list[SelfHostedRunner]:
+        """Get all runners information on GitHub under a repo or org.
 
         Args:
             path: GitHub repository path in the format '<owner>/<repo>', or the GitHub organization
@@ -237,8 +270,8 @@ class GithubClient:
                 if group["name"] == org.group:
                     return group["id"]
         except TypeError as exc:
-            raise GithubApiError(f"Cannot get runner_group_id for group {org.group}.") from exc
-        raise GithubApiError(
+            raise PlatformApiError(f"Cannot get runner_group_id for group {org.group}.") from exc
+        raise PlatformApiError(
             f"Cannot get runner_group_id for group {org.group}."
             " The group does not exist or there are more than 100 groups."
         )

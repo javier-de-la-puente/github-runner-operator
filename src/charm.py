@@ -4,6 +4,7 @@
 # See LICENSE file for licensing details.
 
 """Charm for creating and managing GitHub self-hosted runner instances."""
+from manager_client import GitHubRunnerManagerClient
 from utilities import execute_command, remove_residual_venv_dirs
 
 # This is a workaround for https://bugs.launchpad.net/juju/+bug/2058335
@@ -41,6 +42,7 @@ from ops.framework import StoredState
 from ops.model import ActiveStatus, BlockedStatus, MaintenanceStatus, WaitingStatus
 
 import logrotate
+import manager_service
 from charm_state import (
     DEBUG_SSH_INTEGRATION_NAME,
     IMAGE_INTEGRATION_NAME,
@@ -56,6 +58,9 @@ from errors import (
     ConfigurationError,
     LogrotateSetupError,
     MissingMongoDBError,
+    RunnerManagerApplicationError,
+    RunnerManagerApplicationInstallError,
+    RunnerManagerServiceError,
     SubprocessError,
     TokenError,
 )
@@ -77,6 +82,7 @@ FAILED_TO_RECONCILE_RUNNERS_MSG = "Failed to reconcile runners"
 FAILED_RECONCILE_ACTION_ERR_MSG = (
     "Failed to reconcile runners. Look at the juju logs for more information."
 )
+UPGRADE_MSG = "Upgrading github-runner charm."
 
 
 logger = logging.getLogger(__name__)
@@ -203,15 +209,17 @@ class GithubRunnerCharm(CharmBase):
         self.framework.observe(self.on.check_runners_action, self._on_check_runners_action)
         self.framework.observe(self.on.reconcile_runners_action, self._on_reconcile_runners_action)
         self.framework.observe(self.on.flush_runners_action, self._on_flush_runners_action)
-        self.framework.observe(
-            self.on.update_dependencies_action, self._on_update_dependencies_action
-        )
         self.framework.observe(self.on.update_status, self._on_update_status)
         self.database = DatabaseRequires(
             self, relation_name="mongodb", database_name=REACTIVE_MQ_DB_NAME
         )
         self.framework.observe(self.database.on.database_created, self._on_database_created)
         self.framework.observe(self.database.on.endpoints_changed, self._on_endpoints_changed)
+
+        self._manager_client = GitHubRunnerManagerClient(
+            host=manager_service.GITHUB_RUNNER_MANAGER_ADDRESS,
+            port=manager_service.GITHUB_RUNNER_MANAGER_PORT,
+        )
 
     def _setup_state(self) -> CharmState:
         """Set up the charm state.
@@ -248,6 +256,13 @@ class GithubRunnerCharm(CharmBase):
         except SubprocessError:
             logger.error("Failed to setup runner manager user")
             raise
+
+        try:
+            manager_service.install_package()
+        except RunnerManagerApplicationInstallError:
+            logger.error("Failed to install github runner manager package")
+            # Not re-raising error for until the github-runner-manager service replaces the
+            # library.
 
         try:
             logrotate.setup()
@@ -298,7 +313,7 @@ class GithubRunnerCharm(CharmBase):
     @catch_charm_errors
     def _on_upgrade_charm(self, _: UpgradeCharmEvent) -> None:
         """Handle the update of charm."""
-        logger.info("Reinstalling dependencies...")
+        logger.info(UPGRADE_MSG)
         self._common_install_code()
 
     @catch_charm_errors
@@ -306,6 +321,7 @@ class GithubRunnerCharm(CharmBase):
         """Handle the configuration change."""
         state = self._setup_state()
         self._set_reconcile_timer()
+        self._setup_service(state)
 
         flush_and_reconcile = False
         if state.charm_config.token != self._stored.token:
@@ -364,20 +380,13 @@ class GithubRunnerCharm(CharmBase):
         Args:
             event: The event fired on check_runners action.
         """
-        state = self._setup_state()
-
-        runner_scaler = create_runner_scaler(state, self.app.name, self.unit.name)
-        info = runner_scaler.get_runner_info()
-        event.set_results(
-            {
-                "online": info.online,
-                "busy": info.busy,
-                "offline": info.offline,
-                "unknown": info.unknown,
-                "runners": info.runners,
-                "busy-runners": info.busy_runners,
-            }
-        )
+        try:
+            info = self._manager_client.check_runner()
+        except RunnerManagerServiceError as err:
+            logger.exception("Failed check runner request")
+            event.fail(f"Failed check runner request: {str(err)}")
+            return
+        event.set_results(info)
 
     @catch_action_errors
     def _on_reconcile_runners_action(self, event: ActionEvent) -> None:
@@ -430,21 +439,24 @@ class GithubRunnerCharm(CharmBase):
         self.unit.status = ActiveStatus()
         event.set_results({"delta": {"virtual-machines": delta}})
 
-    @catch_action_errors
-    def _on_update_dependencies_action(self, event: ActionEvent) -> None:
-        """Handle the action of updating dependencies and flushing runners if needed.
-
-        Args:
-            event: Action event of updating dependencies.
-        """
-        # No dependencies managed by the charm for OpenStack-based runners.
-        event.set_results({"flush": False})
-
     @catch_charm_errors
     def _on_update_status(self, _: UpdateStatusEvent) -> None:
         """Handle the update of charm status."""
         self._ensure_reconcile_timer_is_active()
         self._log_juju_processes()
+
+    def _setup_service(self, state: CharmState) -> None:
+        """Set up services.
+
+        Args:
+            state: The charm state.
+        """
+        try:
+            manager_service.setup(state, self.app.name, self.unit.name)
+        except RunnerManagerApplicationError:
+            logging.exception("Unable to setup the github-runner-manager service")
+            # Not re-raising error for until the github-runner-manager service replaces the
+            # library.
 
     @staticmethod
     def _log_juju_processes() -> None:
@@ -507,7 +519,7 @@ class GithubRunnerCharm(CharmBase):
     def _install_deps(self) -> None:
         """Install dependences for the charm."""
         logger.info("Installing charm dependencies.")
-        self._apt_install(["run-one"])
+        self._apt_install(["run-one", "python3-pip"])
 
     def _apt_install(self, packages: Sequence[str]) -> None:
         """Execute apt install command.

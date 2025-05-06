@@ -4,7 +4,7 @@
 """Module containing the main classes for business logic."""
 
 import secrets
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass, field
 
 INSTANCE_SUFFIX_LENGTH = 12
 
@@ -153,3 +153,42 @@ class InstanceID:
             String with the representation of the InstanceID.
         """
         return f"InstanceID({self.name!r})"
+
+
+@dataclass
+class RunnerMetadata:
+    """This class contains information about the runner and the platform it runs in.
+
+    The information in this class is needed to link cloud runners with their
+    platform ones.
+
+    Attributes:
+        platform_name: Platform name where the runner resides (github, jobmanager...)
+        runner_id: Id of the runner in the platform
+        url: URL for the runner.
+    """
+
+    platform_name: str = "github"
+    runner_id: str | None = None
+    url: str | None = None
+
+    def as_dict(self) -> dict[str, str]:
+        """Return the metadata as a dict.
+
+        Returns:
+            metadata as a dict.
+        """
+        return {k: v for k, v in asdict(self).items() if v is not None}
+
+
+@dataclass
+class RunnerContext:
+    """Information provided by the platform provider needed to spawn a runner.
+
+    Attributes:
+        shell_run_script: Script to run the platform agent.
+        ingress_tcp_ports: Ports to be opened in the cloud provider.
+    """
+
+    shell_run_script: str
+    ingress_tcp_ports: list[int] = field(default_factory=lambda: [])
